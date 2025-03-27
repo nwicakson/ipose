@@ -68,6 +68,20 @@ def parse_args_and_config():
                     help='the number of test time steps')
     parser.add_argument('--test_num_diffusion_timesteps', default=500, type=int, metavar='N',
                     help='the number of test times')
+                        
+    # Add implicit layer arguments
+    parser.add_argument('--implicit_layers', action='store_true',
+                        help='Use implicit layers in the model')
+    parser.add_argument('--implicit_start', type=int, default=4,
+                        help='Start implicit layers from this index (0-indexed)')
+    parser.add_argument('--implicit_max_iter', type=int, default=3,
+                        help='Maximum iterations for implicit layers')
+    parser.add_argument('--implicit_tol', type=float, default=0.01,
+                        help='Convergence tolerance for implicit layers')
+    parser.add_argument('--enable_warmstart', action='store_true',
+                        help='Enable warm starting between diffusion steps')
+    parser.add_argument('--mixed_precision', action='store_true',
+                        help='Use mixed precision training')
 
     args = parser.parse_args()
     args.log_path = os.path.join(args.exp, args.doc)
@@ -86,6 +100,20 @@ def parse_args_and_config():
     new_config.optim.lr = args.lr
     new_config.optim.lr_gamma = args.lr_gamma
     new_config.optim.decay = args.decay
+    
+    # Add implicit configuration to config if specified in args
+    if args.implicit_layers:
+        new_config.model.implicit_layers = True
+        new_config.model.implicit_start_layer = args.implicit_start
+        new_config.model.implicit_max_iter = args.implicit_max_iter
+        new_config.model.implicit_tol = args.implicit_tol
+    
+    # Set mixed precision and warmstart if specified
+    if args.mixed_precision:
+        new_config.training.mixed_precision = True
+    
+    if args.enable_warmstart:
+        new_config.testing.enable_warmstart = True
 
     if args.train:
         if os.path.exists(args.log_path):
@@ -114,6 +142,11 @@ def parse_args_and_config():
         if not isinstance(level, int):
             raise ValueError("level {} not supported".format(args.verbose))
 
+        # Clear existing handlers to prevent duplication
+        logger = logging.getLogger()
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+        
         handler1 = logging.StreamHandler()
         handler2 = logging.FileHandler(os.path.join(args.log_path, "stdout.txt"))
         formatter = logging.Formatter(
@@ -121,7 +154,6 @@ def parse_args_and_config():
         )
         handler1.setFormatter(formatter)
         handler2.setFormatter(formatter)
-        logger = logging.getLogger()
         logger.addHandler(handler1)
         logger.addHandler(handler2)
         logger.setLevel(level)
@@ -167,11 +199,26 @@ def main():
     logging.info("Writing log file to {}".format(args.log_path))
     logging.info("Exp instance id = {}".format(os.getpid()))
     
+    # Track GPU memory status
+    if torch.cuda.is_available():
+        logging.info("GPU Memory: {:.2f} GB free out of {:.2f} GB total".format(
+            torch.cuda.get_device_properties(0).total_memory / (1024**3) - torch.cuda.memory_allocated(0) / (1024**3),
+            torch.cuda.get_device_properties(0).total_memory / (1024**3)))
+    
     try:
         runner = Diffpose(args, config)
         runner.create_diffusion_model(args.model_diff_path)
         runner.create_pose_model(args.model_pose_path)
         runner.prepare_data()
+        
+        # Force explicit garbage collection
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logging.info("GPU Memory after model creation: {:.2f} GB free out of {:.2f} GB total".format(
+                torch.cuda.get_device_properties(0).total_memory / (1024**3) - torch.cuda.memory_allocated(0) / (1024**3),
+                torch.cuda.get_device_properties(0).total_memory / (1024**3)))
+        
+        # Train or evaluate based on arguments
         if args.train:
             runner.train()
         else:

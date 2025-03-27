@@ -49,6 +49,15 @@ class Diffpose(object):
         betas = self.betas = torch.from_numpy(betas).float().to(self.device)
         self.num_timesteps = betas.shape[0]
 
+    def log_implicit_stats(self, epoch, i):
+        """Log statistics about implicit layer convergence"""
+        stats = self.model_diff.module.get_iteration_stats()
+        if stats["avg"] > 0:  # Only log if we have data
+            logging.info('| Epoch{:0>4d}: {:0>4d}/{:0>4d} | Implicit Iter: Avg {:.1f}, Max {}, Min {} |'
+                        .format(epoch, i+1, len(self.train_loader), 
+                                stats["avg"], stats["max"], stats["min"]))
+            self.model_diff.module.reset_iteration_stats()
+
     # prepare 2D and 3D skeleton for model training and testing 
     def prepare_data(self):
         args, config = self.args, self.config
@@ -84,10 +93,17 @@ class Diffpose(object):
         self.model_diff = GCNdiff(adj.cuda(), config).cuda()
         self.model_diff = torch.nn.DataParallel(self.model_diff)
         
-        # load pretrained model
+        # load pretrained model if dimensions match
         if model_path:
-            states = torch.load(model_path)
-            self.model_diff.load_state_dict(states[0])
+            try:
+                logging.info('Attempting to initialize model from: ' + model_path)
+                states = torch.load(model_path)
+                self.model_diff.load_state_dict(states[0])
+                logging.info('Successfully loaded pretrained weights')
+            except RuntimeError as e:
+                # Log the error but continue with random initialization
+                logging.warning('Error loading pretrained weights: {}. Initializing randomly.'.format(str(e)))
+                logging.info('This is expected when changing model dimensions.')
             
     def create_pose_model(self, model_path = None):
         args, config = self.args, self.config
@@ -103,13 +119,19 @@ class Diffpose(object):
         self.model_pose = GCNpose(adj.cuda(), config).cuda()
         self.model_pose = torch.nn.DataParallel(self.model_pose)
         
-        # load pretrained model
+        # load pretrained model if dimensions match
         if model_path:
-            logging.info('initialize model by:' + model_path)
-            states = torch.load(model_path)
-            self.model_pose.load_state_dict(states[0])
+            try:
+                logging.info('Attempting to initialize model from: ' + model_path)
+                states = torch.load(model_path)
+                self.model_pose.load_state_dict(states[0])
+                logging.info('Successfully loaded pretrained weights')
+            except RuntimeError as e:
+                # Log the error but continue with random initialization
+                logging.warning('Error loading pretrained weights: {}. Initializing randomly.'.format(str(e)))
+                logging.info('This is expected when changing model dimensions.')
         else:
-            logging.info('initialize model randomly')
+            logging.info('No pretrained model provided. Initializing randomly.')
 
     def train(self):
         cudnn.benchmark = True
@@ -125,7 +147,7 @@ class Diffpose(object):
         if config.data.dataset == "human36m":
             poses_train, poses_train_2d, actions_train, camerapara_train\
                 = fetch_me(self.subjects_train, self.dataset, self.keypoints_train, self.action_filter, stride)
-            data_loader = train_loader = data.DataLoader(
+            self.train_loader = train_loader = data.DataLoader(
                 PoseGenerator_gmm(poses_train, poses_train_2d, actions_train, camerapara_train),
                 batch_size=config.training.batch_size, shuffle=True,\
                     num_workers=config.training.num_workers, pin_memory=True)
@@ -143,8 +165,31 @@ class Diffpose(object):
         start_epoch, step = 0, 0
         
         lr_init, decay, gamma = self.config.optim.lr, self.config.optim.decay, self.config.optim.lr_gamma
-      
+        
+        # Check if mixed precision is enabled in config
+        use_mixed_precision = getattr(config.training, 'mixed_precision', False)
+        if use_mixed_precision:
+            scaler = torch.cuda.amp.GradScaler()
+            logging.info("Using mixed precision training")
+        else:
+            logging.info("Using full precision training")
+        
+        # Configuration for progressive iterations
+        start_epochs = getattr(config.training, 'implicit_warmup_epochs', 20)  # Epochs with min iterations
+        max_iterations = getattr(config.model, 'implicit_max_iter_final', 15)  # Max iterations to reach
+        total_epochs = self.config.training.n_epochs
+
+        # Log the iteration schedule
+        logging.info(f"Progressive iterations: starting with 1 iteration for {start_epochs} epochs, "
+                     f"gradually increasing to {max_iterations} iterations by epoch {total_epochs}")
+        
         for epoch in range(start_epoch, self.config.training.n_epochs):
+            # Update implicit layer iterations based on current epoch
+            if hasattr(self.model_diff.module, 'update_implicit_iterations'):
+                current_max_iter = self.model_diff.module.update_implicit_iterations(
+                    epoch, total_epochs, start_epochs, max_iterations)
+                logging.info(f"Epoch {epoch}: Using max {current_max_iter} iterations for implicit layers")
+            
             data_start = time.time()
             data_time = 0
 
@@ -154,7 +199,7 @@ class Diffpose(object):
             
             epoch_loss_diff = AverageMeter()
 
-            for i, (targets_uvxyz, targets_noise_scale, _, targets_3d, _, _) in enumerate(data_loader):
+            for i, (targets_uvxyz, targets_noise_scale, _, targets_3d, _, _) in enumerate(train_loader):
                 data_time += time.time() - data_start
                 step += 1
 
@@ -175,25 +220,52 @@ class Diffpose(object):
                 # generate x_t (refer to DDIM equation)
                 x = x * a.sqrt() + e * (1.0 - a).sqrt()
                 
-                # predict noise
-                output_noise = self.model_diff(x, src_mask, t.float(), 0)
-                loss_diff = (e - output_noise).square().sum(dim=(1, 2)).mean(dim=0)
-                
-                optimizer.zero_grad()
-                loss_diff.backward()
-                
-                torch.nn.utils.clip_grad_norm_(
-                    self.model_diff.parameters(), config.optim.grad_clip)                
-                optimizer.step()
+                # Use mixed precision if enabled
+                if use_mixed_precision:
+                    with torch.cuda.amp.autocast():
+                        # predict noise
+                        output_noise = self.model_diff(x, src_mask, t.float(), 0)
+                        loss_diff = (e - output_noise).square().sum(dim=(1, 2)).mean(dim=0)
+                    
+                    optimizer.zero_grad()
+                    
+                    # Use the gradient scaler for mixed precision
+                    scaler.scale(loss_diff).backward()
+                    
+                    # Unscale before gradient clipping
+                    scaler.unscale_(optimizer)
+                    
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model_diff.parameters(), config.optim.grad_clip)                
+                    
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Standard precision training
+                    output_noise = self.model_diff(x, src_mask, t.float(), 0)
+                    loss_diff = (e - output_noise).square().sum(dim=(1, 2)).mean(dim=0)
+                    
+                    optimizer.zero_grad()
+                    loss_diff.backward()
+                    
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model_diff.parameters(), config.optim.grad_clip)                
+                    
+                    optimizer.step()
             
                 epoch_loss_diff.update(loss_diff.item(), n)
             
                 if self.config.model.ema:
                     ema_helper.update(self.model_diff)
                 
+                # Explicit cache clearing every few iterations
+                if i % 10 == 0:
+                    torch.cuda.empty_cache()
+                
                 if i%100 == 0 and i != 0:
+                    self.log_implicit_stats(epoch, i)
                     logging.info('| Epoch{:0>4d}: {:0>4d}/{:0>4d} | Step {:0>6d} | Data: {:.6f} | Loss: {:.6f} |'\
-                        .format(epoch, i+1, len(data_loader), step, data_time, epoch_loss_diff.avg))
+                        .format(epoch, i+1, len(train_loader), step, data_time, epoch_loss_diff.avg))
             
             data_start = time.time()
 
@@ -293,18 +365,36 @@ class Diffpose(object):
             a = (1-b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1)
             # x = x * a.sqrt() + e * (1.0 - a).sqrt()
             
-            output_uvxyz = generalized_steps(x, src_mask, seq, self.model_diff, self.betas, eta=self.args.eta)
+            # Reset implicit layer solutions at the start of sampling
+            if hasattr(self.model_diff, 'module') and hasattr(self.model_diff.module, 'implicit_layers'):
+                for layer in self.model_diff.module.implicit_layers:
+                    layer.initial_z = None
+            elif hasattr(self.model_diff, 'implicit_layers'):
+                for layer in self.model_diff.implicit_layers:
+                    layer.initial_z = None
+            
+            # Clear cache before sampling
+            torch.cuda.empty_cache()
+            
+            # Use generalized steps with warm starting disabled
+            kwargs = {'enable_warmstart': getattr(config.testing, 'enable_warmstart', False),
+                      'eta': self.args.eta}
+            
+            output_uvxyz = generalized_steps(x, src_mask, seq, self.model_diff, self.betas, **kwargs)
             output_uvxyz = output_uvxyz[0][-1]            
             output_uvxyz = torch.mean(output_uvxyz.reshape(test_times,-1,17,5),0)
             output_xyz = output_uvxyz[:,:,2:]
             output_xyz[:, :, :] -= output_xyz[:, :1, :]
             targets_3d[:, :, :] -= targets_3d[:, :1, :]
             epoch_loss_3d_pos.update(mpjpe(output_xyz, targets_3d).item() * 1000.0, targets_3d.size(0))
-            epoch_loss_3d_pos_procrustes.update(p_mpjpe(output_xyz.cpu().numpy(), targets_3d.cpu().numpy()).item() * 1000.0, targets_3d.size(0))\
+            epoch_loss_3d_pos_procrustes.update(p_mpjpe(output_xyz.cpu().numpy(), targets_3d.cpu().numpy()).item() * 1000.0, targets_3d.size(0))
             
             data_start = time.time()
             
             action_error_sum = test_calculation(output_xyz, targets_3d, input_action, action_error_sum, None, None)
+            
+            # Clear cache after each batch
+            torch.cuda.empty_cache()
             
             if i%100 == 0 and i != 0:
                 logging.info('({batch}/{size}) Data: {data:.6f}s | MPJPE: {e1: .4f} | P-MPJPE: {e2: .4f}'\

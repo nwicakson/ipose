@@ -103,9 +103,9 @@ def attention(Q, K, V, mask=None, dropout=None):
     # scores: [batch_size, 8, max_len, max_len]
     scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
 
-    # padding mask
+    # padding mask - use -1e4 instead of -1e9 for FP16 compatibility
     if mask is not None:
-        scores = scores.masked_fill(mask == 0, -1e9)
+        scores = scores.masked_fill(mask == 0, -1e4)
 
     p_attn = F.softmax(scores, dim=-1)
     if dropout is not None:
@@ -242,4 +242,3 @@ if __name__ == '__main__':
     model = GraFormer(adj=adj, hid_dim=128)
     x = torch.zeros((1, 21, 2))
     print(model(x, src_mask))
-
