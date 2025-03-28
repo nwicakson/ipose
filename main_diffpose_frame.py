@@ -74,14 +74,20 @@ def parse_args_and_config():
                         help='Use implicit layers in the model')
     parser.add_argument('--implicit_start', type=int, default=4,
                         help='Start implicit layers from this index (0-indexed)')
-    parser.add_argument('--implicit_max_iter', type=int, default=3,
+    parser.add_argument('--implicit_max_iter', type=int, default=1,
                         help='Maximum iterations for implicit layers')
-    parser.add_argument('--implicit_tol', type=float, default=0.01,
+    parser.add_argument('--implicit_max_iter_final', type=int, default=5,
+                        help='Final maximum iterations to reach')
+    parser.add_argument('--implicit_tol', type=float, default=0.05,
                         help='Convergence tolerance for implicit layers')
+    parser.add_argument('--implicit_warmup_epochs', type=int, default=60,
+                        help='Number of epochs to run with minimal iterations')
     parser.add_argument('--enable_warmstart', action='store_true',
                         help='Enable warm starting between diffusion steps')
     parser.add_argument('--mixed_precision', action='store_true',
                         help='Use mixed precision training')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug mode with extra safety checks')
 
     args = parser.parse_args()
     args.log_path = os.path.join(args.exp, args.doc)
@@ -95,6 +101,7 @@ def parse_args_and_config():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     logging.info("Using device: {}".format(device))
     new_config.device = device
+    
     # update configure file
     new_config.training.batch_size = args.batch_size
     new_config.optim.lr = args.lr
@@ -106,7 +113,9 @@ def parse_args_and_config():
         new_config.model.implicit_layers = True
         new_config.model.implicit_start_layer = args.implicit_start
         new_config.model.implicit_max_iter = args.implicit_max_iter
+        new_config.model.implicit_max_iter_final = args.implicit_max_iter_final
         new_config.model.implicit_tol = args.implicit_tol
+        new_config.training.implicit_warmup_epochs = args.implicit_warmup_epochs
     
     # Set mixed precision and warmstart if specified
     if args.mixed_precision:
@@ -114,6 +123,11 @@ def parse_args_and_config():
     
     if args.enable_warmstart:
         new_config.testing.enable_warmstart = True
+        
+    # Add testing configuration
+    new_config.testing.test_times = args.test_times
+    new_config.testing.test_timesteps = args.test_timesteps
+    new_config.testing.test_num_diffusion_timesteps = args.test_num_diffusion_timesteps
 
     if args.train:
         if os.path.exists(args.log_path):
@@ -179,6 +193,13 @@ def parse_args_and_config():
         torch.cuda.manual_seed_all(args.seed)
 
     torch.backends.cudnn.benchmark = True
+    
+    # Set deterministic behavior for reproducibility if debugging
+    if args.debug:
+        logging.info("Setting deterministic behavior for debugging")
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        os.environ['PYTHONHASHSEED'] = str(args.seed)
 
     return args, new_config
 
@@ -202,7 +223,7 @@ def main():
     # Track GPU memory status
     if torch.cuda.is_available():
         logging.info("GPU Memory: {:.2f} GB free out of {:.2f} GB total".format(
-            torch.cuda.get_device_properties(0).total_memory / (1024**3) - torch.cuda.memory_allocated(0) / (1024**3),
+            (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / (1024**3),
             torch.cuda.get_device_properties(0).total_memory / (1024**3)))
     
     try:
@@ -215,7 +236,7 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             logging.info("GPU Memory after model creation: {:.2f} GB free out of {:.2f} GB total".format(
-                torch.cuda.get_device_properties(0).total_memory / (1024**3) - torch.cuda.memory_allocated(0) / (1024**3),
+                (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / (1024**3),
                 torch.cuda.get_device_properties(0).total_memory / (1024**3)))
         
         # Train or evaluate based on arguments
@@ -223,7 +244,8 @@ def main():
             runner.train()
         else:
             _, _ = runner.test_hyber()
-    except Exception:
+    except Exception as e:
+        logging.error(f"Error in main execution: {e}")
         logging.error(traceback.format_exc())
 
     return 0

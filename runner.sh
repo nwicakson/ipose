@@ -15,11 +15,13 @@ traingt() {
 }
 
 trainipose() {
-    python main_diffpose_frame.py \
+    CUDA_VISIBLE_DEVICES=2 python main_diffpose_frame.py \
     --train --implicit_layers \
-    --config human36m_diffpose_uvxyz_gt.yml --batch_size 512 \
+    --config human36m_diffpose_uvxyz_gt.yml --batch_size 1024 \
+    --debug \
     --doc ipose --exp exp --ni \
     >exp/ipose.out 2>&1 & \
+    
 }
 
 trainipose2() {

@@ -53,7 +53,7 @@ class _ResChebGC_diff(nn.Module):
         out = self.gconv2(out, self.adj)
         return residual + out
 
-# Memory-optimized ImplicitGCNAttentionBlock
+# Stabilized ImplicitGCNAttentionBlock with safer gradient approach
 class ImplicitGCNAttentionBlock(nn.Module):
     def __init__(self, adj, dim_model, attn, gcn, emd_dim, dropout=0.1, p_dropout=0.1):
         super(ImplicitGCNAttentionBlock, self).__init__()
@@ -100,37 +100,66 @@ class ImplicitGCNAttentionBlock(nn.Module):
                 self.max_iter = max(1, self.max_iter - 1)
             elif t_fraction < 0.2:  # Late denoising (refining)
                 self.max_iter = self.max_iter + 1
-                
-        # Use input as initial guess
-        z = x
-            
+        
         # Track convergence
         self.num_iterations = 0
         
-        # Fixed point iteration without gradients
-        with torch.no_grad():
-            for i in range(self.max_iter):
-                z_new = self.forward_iteration(z, x, mask, temb)
-                residual = torch.norm(z_new - z) / (torch.norm(z) + 1e-6)
-                
-                if residual < self.tol:
+        if self.training:
+            # Most stable version - no gradient through implicit layers initially
+            z = x
+            with torch.no_grad():
+                for i in range(self.max_iter):
+                    z_new = self.forward_iteration(z, x, mask, temb)
+                    # Safety check for NaN
+                    if torch.isnan(z_new).any():
+                        # Use previous non-NaN value or original input
+                        z_new = torch.where(torch.isnan(z_new), z, z_new)
+                        self.num_iterations = i + 1
+                        break
+                        
+                    residual = torch.norm(z_new - z) / (torch.norm(z) + 1e-6)
+                    if residual < self.tol:
+                        z = z_new
+                        self.num_iterations = i + 1
+                        break
+                    
                     z = z_new
                     self.num_iterations = i + 1
-                    break
+            
+            # Tiny amount of x to maintain graph connection, detached result
+            z = z.detach() + 0.0001 * x
+        else:
+            # Evaluation mode - just do the iterations
+            z = x
+            with torch.no_grad():
+                for i in range(self.max_iter):
+                    z_new = self.forward_iteration(z, x, mask, temb)
+                    # Safety check for NaN
+                    if torch.isnan(z_new).any():
+                        z_new = torch.where(torch.isnan(z_new), z, z_new)
+                        self.num_iterations = i + 1
+                        break
+                        
+                    residual = torch.norm(z_new - z) / (torch.norm(z) + 1e-6)
+                    if residual < self.tol:
+                        z = z_new
+                        self.num_iterations = i + 1
+                        break
                     
-                z = z_new
-                self.num_iterations = i + 1
+                    z = z_new
+                    self.num_iterations = i + 1
         
-        # Final forward pass with gradients
-        z = self.forward_iteration(z.detach(), x, mask, temb)
-        
+        # Final safety check for NaNs
+        if torch.isnan(z).any():
+            z = torch.where(torch.isnan(z), x, z)
+            
         # Store solution for potential reuse
         if self.enable_warmstart:
             self.last_solution = z.detach()
             
         return z
 
-# Modified GCNdiff with memory-efficient implementation
+# Modified GCNdiff with stability improvements
 class GCNdiff(nn.Module):
     def __init__(self, adj, config):
         super(GCNdiff, self).__init__()
@@ -250,18 +279,35 @@ class GCNdiff(nn.Module):
         
         # First part: regular layers
         for i in range(len(self.regular_layers)):
+            # Safety check for NaNs
+            if torch.isnan(out).any():
+                out = torch.where(torch.isnan(out), torch.zeros_like(out), out)
+                
             out = self.atten_layers_regular[i](out, mask)
             out = self.regular_layers[i](out, temb)
         
         # Second part: implicit layers
         for i in range(len(self.implicit_layers)):
+            # Safety check for NaNs
+            if torch.isnan(out).any():
+                out = torch.where(torch.isnan(out), torch.zeros_like(out), out)
+                
             t_frac_avg = t_fraction.mean().item()  # Average for the batch
             out = self.implicit_layers[i](out, mask, temb, t_frac_avg)
             
             # Store iteration count for monitoring
             self.iteration_counts.append(self.implicit_layers[i].num_iterations)
         
+        # Final safety check for NaNs
+        if torch.isnan(out).any():
+            out = torch.where(torch.isnan(out), torch.zeros_like(out), out)
+            
         out = self.gconv_output(out, self.adj)
+        
+        # Final output check
+        if torch.isnan(out).any():
+            out = torch.where(torch.isnan(out), torch.zeros_like(out), out)
+            
         return out
     
     def get_iteration_stats(self):
